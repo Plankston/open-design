@@ -29,7 +29,7 @@ import {
 import { latestTodoWriteInputForPinnedCard } from '../runtime/todos';
 import { TodoCard } from './ToolCard';
 import type { AppConfig, ChatAttachment, ChatCommentAttachment, ChatMessage, ChatMessageFeedbackChange, Conversation, DesignSystemSummary, PreviewComment, Project, ProjectFile, ProjectMetadata, SkillSummary } from '../types';
-import { dayKey, dayLabel, exactDateTime, messageTime, relativeTimeLong } from '../utils/chatTime';
+import { dayKey, dayLabel, exactDateTime, messageTime, relativeTimeLong, shortTime } from '../utils/chatTime';
 import { commentTargetDisplayName, commentsToAttachments, simplePositionLabel } from '../comments';
 import { AssistantMessage } from './AssistantMessage';
 import { AmrGuidance } from './AmrGuidance';
@@ -278,6 +278,10 @@ interface Props {
   activePluginActionPaths?: Set<string>;
   hiddenPluginActionPaths?: Set<string>;
   forceStreamingMessageIds?: Set<string>;
+  // Live-only streaming tool-input partials keyed by tool-use id. Threaded to
+  // AssistantMessage so an in-flight Write/Edit can render its code in real
+  // time before the full `tool_use` arrives. Never persisted.
+  liveToolInput?: Record<string, { name: string; text: string }>;
   initialDraft?: string;
   // Question-form submissions become a normal user message; the parent
   // routes that text through onSend (no attachments).
@@ -395,6 +399,9 @@ interface QueuedSendUpdate {
   meta?: ChatSendMeta;
 }
 
+// Gap left above the anchored user message when it is pinned to the top.
+const ANCHOR_TOP_PADDING = 12;
+
 export function ChatPane({
   messages,
   streaming,
@@ -430,6 +437,7 @@ export function ChatPane({
   activePluginActionPaths,
   hiddenPluginActionPaths,
   forceStreamingMessageIds,
+  liveToolInput,
   initialDraft,
   onSubmitForm,
   onOpenQuestions,
@@ -495,6 +503,19 @@ export function ChatPane({
   // shouldn't be yanked back the moment the next chunk streams in.
   const pinnedToBottomRef = useRef(true);
   const scrolledToFormRef = useRef<Set<string>>(new Set());
+  // "Anchor the just-sent turn to the top" (ChatGPT-style). On send we pin
+  // the user's message to the top of the viewport and let the reply stream
+  // below it instead of following the bottom. `pending` is armed by the
+  // composer's onSend; the messages effect promotes it to `active` once the
+  // new user turn actually renders. A dynamic tail spacer reserves just
+  // enough real, scrollable blank space below the turn so the message can
+  // reach the top even when the reply is short. The spacer is only resized
+  // while the message sits at its pinned position — once the user scrolls
+  // below it, the reserved blank stays put (no collapse, no jump).
+  const anchorPendingRef = useRef(false);
+  const anchorActiveRef = useRef(false);
+  const tailSpacerRef = useRef<HTMLDivElement | null>(null);
+  const prevLastUserIdRef = useRef<string | undefined>(undefined);
   // AssistantMessage's four interaction callbacks are re-created per render and
   // excluded from its memo comparison (so streaming doesn't re-render every
   // message). Route them through this ref so a memoized message still calls the
@@ -767,6 +788,31 @@ export function ChatPane({
     // cutoff tracked by the ref (not the wider 120px jump-button
     // threshold) so a deliberate ~90px scroll-up isn't snapped back the
     // next time content streams in. Issue #983.
+
+    // A brand-new user turn from a local send: switch to "anchor to top"
+    // mode and smooth-scroll their message to the top of the viewport.
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    const prevUserId = prevLastUserIdRef.current;
+    prevLastUserIdRef.current = lastUser?.id;
+    if (anchorPendingRef.current && lastUser && lastUser.id !== prevUserId) {
+      anchorPendingRef.current = false;
+      anchorActiveRef.current = true;
+      pinnedToBottomRef.current = false;
+      setScrolledFromBottom(true);
+      requestAnimationFrame(() => {
+        sizeAnchorSpacer();
+        scrollAnchorToTop();
+      });
+      return;
+    }
+    // While anchored, the message stays at the top on its own (nothing above
+    // it changes), so we only shrink the spacer as the reply grows — never
+    // re-scroll. This is what keeps scrolling down and the final settle smooth.
+    if (anchorActiveRef.current) {
+      requestAnimationFrame(sizeAnchorSpacer);
+      return;
+    }
+
     if (pinnedToBottomRef.current) {
       // If the last assistant message contains a question form, scroll to
       // the form instead of the bottom, so the user lands on the form.
@@ -865,6 +911,19 @@ export function ChatPane({
     function onScroll() {
       const target = logRef.current;
       if (!target) return;
+      // A genuine user scroll (one that moves away from where the anchored
+      // message currently sits) releases the auto-resize behavior. We do NOT
+      // collapse the tail spacer: the reserved blank below stays as real,
+      // scrollable space so scrolling down feels natural instead of snapping.
+      if (anchorActiveRef.current) {
+        const pinnedTop = lastUserMsgTopInContent(target);
+        if (
+          pinnedTop !== null &&
+          Math.abs(target.scrollTop - (pinnedTop - ANCHOR_TOP_PADDING)) > 40
+        ) {
+          anchorActiveRef.current = false;
+        }
+      }
       syncScrollable(target);
       markScrolling();
       snapshot(target);
@@ -901,6 +960,18 @@ export function ChatPane({
 
     let followFrame: number | null = null;
     const followLatestIfPinned = () => {
+      // While anchored, only shrink the tail spacer as the reply grows
+      // (resize-only, never scroll) so the user message stays put without
+      // fighting a manual scroll-down.
+      if (anchorActiveRef.current) {
+        if (followFrame !== null) return;
+        followFrame = requestAnimationFrame(() => {
+          followFrame = null;
+          if (!anchorActiveRef.current) return;
+          sizeAnchorSpacer();
+        });
+        return;
+      }
       if (!pinnedToBottomRef.current || followFrame !== null) return;
       followFrame = requestAnimationFrame(() => {
         followFrame = null;
@@ -927,6 +998,9 @@ export function ChatPane({
     const syncObservedChildren = () => {
       if (!resizeObserver) return;
       const currentChildren = new Set(Array.from(el.children));
+      // The tail spacer's height is driven by the anchor logic; observing it
+      // would feed its own resize back into followLatestIfPinned.
+      if (tailSpacerRef.current) currentChildren.delete(tailSpacerRef.current);
       for (const child of currentChildren) {
         if (observedChildren.has(child)) continue;
         resizeObserver.observe(child);
@@ -1041,9 +1115,59 @@ export function ChatPane({
     [conversations, deferredConversationSearch, t],
   );
 
+  function resetTailSpacer() {
+    const s = tailSpacerRef.current;
+    if (s) s.style.height = '0px';
+  }
+
+  // Content offset (distance from the top of the scroll content) of the most
+  // recent user message. Invariant to the current scrollTop, so it's safe to
+  // call regardless of where the user has scrolled.
+  function lastUserMsgTopInContent(el: HTMLDivElement): number | null {
+    const userEls = el.querySelectorAll<HTMLElement>('.msg.user');
+    const msgEl = userEls[userEls.length - 1];
+    if (!msgEl) return null;
+    const elRect = el.getBoundingClientRect();
+    const msgRect = msgEl.getBoundingClientRect();
+    return el.scrollTop + (msgRect.top - elRect.top);
+  }
+
+  // Resize the tail spacer so the anchored message can sit at the top with
+  // just enough room below it — no more. This is a resize ONLY (never a
+  // scroll): shrinking empty space below the fold can't shift what's visible
+  // while the user is pinned near the top, so it never causes jitter. As the
+  // reply streams in, `needed` shrinks monotonically toward 0.
+  function sizeAnchorSpacer() {
+    const el = logRef.current;
+    const spacer = tailSpacerRef.current;
+    if (!el || !spacer) return;
+    const msgTopInContent = lastUserMsgTopInContent(el);
+    if (msgTopInContent === null) return;
+    const spacerH = spacer.offsetHeight;
+    const contentBelow = el.scrollHeight - spacerH - msgTopInContent;
+    const needed = Math.max(0, el.clientHeight - contentBelow - ANCHOR_TOP_PADDING);
+    spacer.style.height = `${needed}px`;
+  }
+
+  // Smooth-scroll the anchored message to the top. Called ONCE per turn (on
+  // send). The message then stays at the top on its own as the reply streams
+  // below it, so we never re-scroll — re-scrolling each chunk is what caused
+  // the scroll-down fight and the settle jitter.
+  function scrollAnchorToTop() {
+    const el = logRef.current;
+    if (!el) return;
+    const msgTopInContent = lastUserMsgTopInContent(el);
+    if (msgTopInContent === null) return;
+    const target = Math.max(0, msgTopInContent - ANCHOR_TOP_PADDING);
+    el.scrollTo({ top: target, behavior: 'smooth' });
+  }
+
   function jumpToBottom() {
     const el = logRef.current;
     if (!el) return;
+    anchorActiveRef.current = false;
+    pinnedToBottomRef.current = true;
+    resetTailSpacer();
     el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }
 
@@ -1191,6 +1315,21 @@ export function ChatPane({
               ].filter(Boolean).join(' ')}
               ref={logRef}
               aria-busy={loading}
+              onClickCapture={(e) => {
+                // Expanding an accordion (tool card / thinking block) should
+                // grow downward with the clicked header staying put. While a
+                // run is glued to the bottom, the ResizeObserver would re-pin
+                // to the bottom on the height change and push the header up,
+                // so unpin the moment the user toggles one open.
+                const toggle = (e.target as HTMLElement).closest(
+                  '.thinking-toggle, .action-card-toggle, button.op-card-head, [aria-expanded]',
+                );
+                if (toggle && logRef.current?.contains(toggle)) {
+                  pinnedToBottomRef.current = false;
+                  anchorActiveRef.current = false;
+                  setScrolledFromBottom(true);
+                }
+              }}
             >
               {loading ? <ChatConversationLoading t={t} /> : null}
               {messages.length === 0 && !loading ? (
@@ -1263,6 +1402,7 @@ export function ChatPane({
               <ChatRows
                 messages={messages}
                 streaming={streaming}
+                liveToolInput={liveToolInput}
                 projectId={projectId}
                 projectKindForTracking={projectKindForTracking}
                 activeConversationId={activeConversationId}
@@ -1381,6 +1521,10 @@ export function ChatPane({
                   }}
                 />
               ) : null}
+              {/* Dynamic spacer: when a turn is anchored to the top, this
+                  grows just enough to let the user message reach the top of
+                  the viewport, then shrinks as the reply streams in below. */}
+              <div className="chat-log-tail-spacer" ref={tailSpacerRef} aria-hidden />
             </div>
             {/* Always mounted so the CSS transition can play in both
                 directions; the `chat-jump-btn-active` class flips the
@@ -1456,6 +1600,9 @@ export function ChatPane({
                 setEditingQueuedSendId(null);
                 return;
               }
+              // Arm "anchor to top": the messages effect promotes this once
+              // the new user turn renders, pinning it to the top of the view.
+              anchorPendingRef.current = true;
               onSend(prompt, attachments, commentAttachments, meta);
             }}
             onStop={onStop}
@@ -1531,6 +1678,7 @@ function ChatConversationLoading({ t }: { t: TranslateFn }) {
 function ChatRows({
   messages,
   streaming,
+  liveToolInput,
   projectId,
   projectKindForTracking,
   activeConversationId,
@@ -1563,6 +1711,7 @@ function ChatRows({
 }: {
   messages: ChatMessage[];
   streaming: boolean;
+  liveToolInput?: Record<string, { name: string; text: string }>;
   projectId: string | null;
   projectKindForTracking: TrackingProjectKind | null;
   activeConversationId: string | null;
@@ -1642,6 +1791,7 @@ function ChatRows({
       <AssistantMessage
         message={m}
         streaming={messageStreaming}
+        liveToolInput={liveToolInput}
         projectId={projectId}
         projectKind={projectKindForTracking}
         conversationId={activeConversationId}
@@ -2531,6 +2681,7 @@ function UserMessageImpl({
   }
 
   const isDesignSystemWorkspaceRequest = isDesignSystemWorkspacePrompt(message.content);
+  const ts = messageTime(message);
 
   return (
     <div className="msg user">
@@ -2625,15 +2776,26 @@ function UserMessageImpl({
       ) : message.content ? (
         <div className="user-text-wrap">
           <div className="user-text user-bubble">{message.content}</div>
-          <button
-            type="button"
-            className="ghost user-copy-btn"
-            onClick={handleCopy}
-            aria-label={copied ? t('chat.copyDone') : t('chat.copyPrompt')}
-            title={copied ? t('chat.copyDone') : t('chat.copyPrompt')}
-          >
-            <Icon name={copied ? 'check' : 'copy'} size={12} />
-          </button>
+          <div className="user-actions">
+            {ts ? (
+              <time
+                className="user-actions-time"
+                dateTime={new Date(ts).toISOString()}
+                title={exactDateTime(ts)}
+              >
+                {shortTime(ts)}
+              </time>
+            ) : null}
+            <button
+              type="button"
+              className="ghost user-copy-btn"
+              onClick={handleCopy}
+              aria-label={copied ? t('chat.copyDone') : t('chat.copyPrompt')}
+              title={copied ? t('chat.copyDone') : t('chat.copyPrompt')}
+            >
+              <Icon name={copied ? 'check' : 'copy'} size={13} />
+            </button>
+          </div>
         </div>
       ) : null}
     </div>
@@ -2663,7 +2825,9 @@ function ActivePluginChip({
       <span className="msg-plugin-chip__label">
         <span className="msg-plugin-chip__kind">Plugin</span>
         <span className="msg-plugin-chip__title">{title}</span>
-        <span className="msg-plugin-chip__version">@{version}</span>
+        {version ? (
+          <span className="msg-plugin-chip__version">@{version}</span>
+        ) : null}
       </span>
       {taskKind ? (
         <span className="msg-plugin-chip__task">{taskKind}</span>
@@ -2753,6 +2917,33 @@ function ActiveDesignSystemChip({
       {content}
     </button>
   );
+}
+
+function DaySeparator({ ts }: { ts: number | undefined }) {
+  if (!ts) return null;
+  return (
+    <div className="chat-day-separator" role="separator">
+      <time dateTime={new Date(ts).toISOString()}>{dayLabel(ts)}</time>
+    </div>
+  );
+}
+
+function MessageTimestamp({ message, t }: { message: ChatMessage; t: TranslateFn }) {
+  const ts = messageTime(message);
+  if (!ts) return null;
+  return (
+    <time className="msg-time" dateTime={new Date(ts).toISOString()} title={exactDateTime(ts)}>
+      {relativeTimeLong(ts, t)}
+    </time>
+  );
+}
+
+function shouldShowDaySeparator(prev: ChatMessage | undefined, curr: ChatMessage): boolean {
+  const currTime = messageTime(curr);
+  if (!currTime) return false;
+  const prevTime = prev ? messageTime(prev) : undefined;
+  if (!prevTime) return true;
+  return dayKey(prevTime) !== dayKey(currTime);
 }
 
 const WORKSPACE_DESIGN_FILES_TAB = '__design_files__';
@@ -2866,33 +3057,6 @@ function sortChatAttachmentsForDisplay(attachments: ChatAttachment[]): ChatAttac
       return a.index - b.index;
     })
     .map((entry) => entry.attachment);
-}
-
-function DaySeparator({ ts }: { ts: number | undefined }) {
-  if (!ts) return null;
-  return (
-    <div className="chat-day-separator" role="separator">
-      <time dateTime={new Date(ts).toISOString()}>{dayLabel(ts)}</time>
-    </div>
-  );
-}
-
-function MessageTimestamp({ message, t }: { message: ChatMessage; t: TranslateFn }) {
-  const ts = messageTime(message);
-  if (!ts) return null;
-  return (
-    <time className="msg-time" dateTime={new Date(ts).toISOString()} title={exactDateTime(ts)}>
-      {relativeTimeLong(ts, t)}
-    </time>
-  );
-}
-
-function shouldShowDaySeparator(prev: ChatMessage | undefined, curr: ChatMessage): boolean {
-  const currTime = messageTime(curr);
-  if (!currTime) return false;
-  const prevTime = prev ? messageTime(prev) : undefined;
-  if (!prevTime) return true;
-  return dayKey(prevTime) !== dayKey(currTime);
 }
 
 function relTime(ts: number, t: TranslateFn): string {
